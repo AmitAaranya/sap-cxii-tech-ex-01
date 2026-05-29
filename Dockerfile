@@ -16,5 +16,5 @@ EXPOSE 8000
 # Define environment variable
 ENV NAME ProductSimilarityApp
 
-# Run app.py when the container launches
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+# Run the microservice when the container launches
+CMD ["uvicorn", "app.server:app", "--host", "0.0.0.0", "--port", "8000"]
