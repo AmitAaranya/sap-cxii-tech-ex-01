@@ -166,6 +166,193 @@ $$\text{rank} = \frac{1}{\text{score}} - k$$
 
 ---
 
+## Scaling to 50 Enterprise Customers
+
+The current service is a correct single-tenant PoC. The following changes are required before it can serve enterprise customers at scale. Each change is independently shippable; they are ordered from lowest to highest effort.
+
+### Target Architecture
+
+```
+                         ┌──────────────────────────────────────────────────────────────────┐
+                         │  Enterprise Customer (× 50)                                      │
+                         │  ERP / Commerce Cloud / SAP S/4HANA                              │
+                         └────────────────────────┬─────────────────────────────────────────┘
+                                                  │ product upsert events
+                                                  ▼
+                         ┌──────────────────────────────────────────────────────────────────┐
+                         │  SAP Event Mesh / Kafka                                          │
+                         │  (one topic per tenant)                                          │
+                         └──────┬───────────────────────────────────────────────────────────┘
+                                │
+                 ┌──────────────┘
+                 ▼
+  ┌──────────────────────────┐        ┌──────────────────────────────┐
+  │   Indexing Workers       │        │   Object Store               │
+  │   (auto-scaled pods)     │──────► │   S3 / GCS / SAP BTP         │
+  │                          │        │   (raw catalogue per tenant) │
+  │  1. fetch text_blob      │        └──────────────────────────────┘
+  │  2. call Embedding Svc   │
+  │  3. upsert → vector DB   │
+  └──────────┬───────────────┘
+             │ upsert embeddings
+             ▼
+┌────────────────────────────────────────────────────────────────────┐
+│  Vector Store Cluster                                              │
+│  ChromaDB (Stage 1) → SAP HANA Cloud Vector Engine (Stage 2)      │
+│                                                                    │
+│  collection: features_{tenant_id}   collection: semantic_{tenant_id} │
+└────────────────────────────────────────────────────────────────────┘
+             ▲                                        ▲
+             │ read-only queries                      │
+             └────────────────┬───────────────────────┘
+                              │
+                 ┌────────────▼─────────────┐
+                 │   Query Service          │
+                 │   FastAPI  --workers 4   │
+                 │                          │
+                 │  tenant_id from JWT  ──► │──► Tenant Router
+                 │  RRF fusion              │      (collection selector)
+                 └────────────┬─────────────┘
+                              │ encode(text_blob)
+                              ▼
+                 ┌────────────────────────────┐
+                 │   Embedding Service        │
+                 │   FastAPI + ONNX / Triton  │
+                 │                            │
+                 │   Redis cache              │
+                 │   key: sha256(text)        │
+                 └────────────────────────────┘
+                              ▲
+                              │ (same service used by Indexing Workers)
+                              │
+         ┌────────────────────┴──────────────────────────┐
+         │                                               │
+         │   API Gateway (mTLS)                          │
+         │   X-API-Key → tenant_id resolution            │
+         │   Rate limiting per tenant                    │
+         └───────────────────────────────────────────────┘
+                              ▲
+                              │ HTTPS
+                 ┌────────────┴────────────┐
+                 │   Client applications   │
+                 │   (per enterprise)      │
+                 └─────────────────────────┘
+
+Observability plane (cross-cutting)
+─────────────────────────────────────────────────────────────────────
+  Prometheus ◄── /metrics on every service (labelled by tenant_id)
+  Grafana    ◄── dashboards: query p99, index staleness, cache hit rate
+  Alertmanager── p99 > 200 ms │ index staleness > 15 min │ cache hit < 60%
+```
+
+---
+
+### 1 — Remove data from the container image
+
+**Problem:** The dataset is `COPY`-ed into the image at build time. This couples every catalogue update to a full image rebuild and push, inflates image size, and makes multi-tenant isolation impossible.
+
+**Change:** Make the container stateless. Remove `COPY data/ data/` from the `Dockerfile`. At startup, pull the catalogue from an object store (S3, GCS, or SAP BTP Object Store) using the `CATALOGUE_URI` environment variable. Mount persistent stores via a Kubernetes `PersistentVolumeClaim` rather than relying on the container filesystem.
+
+```dockerfile
+# Remove this line from the Dockerfile
+# COPY data/ data/
+
+# Add at runtime via env var + init script
+ENV CATALOGUE_URI=""
+ENV CHROMA_DB_PATH=/app/stores/chroma_db
+```
+
+---
+
+### 2 — Replace ChromaDB `PersistentClient` with a server-mode backend
+
+**Problem:** `chromadb.PersistentClient` uses a file-backed SQLite store. It does not support concurrent access from multiple processes or hosts. The `--workers 1` caveat in the `CMD` is a direct consequence.
+
+**Change (Stage 1 — 1–10 tenants):** Deploy ChromaDB in HTTP server mode (one pod), and point the client at it:
+
+```python
+# app/store/vectordb.py
+self._client = chromadb.HttpClient(host=os.environ["CHROMA_HOST"], port=8001)
+```
+
+This immediately unlocks `--workers 4` on the query service and removes the single-process constraint.
+
+**Change (Stage 2 — 10–50 tenants):** Migrate to a managed or clustered vector store — ChromaDB distributed, Qdrant, Weaviate, or SAP HANA Cloud Vector Engine. HANA Cloud is the preferred choice if the system-of-record is already SAP, as it eliminates a network hop and simplifies data-governance compliance.
+
+---
+
+### 3 — Add a tenant routing layer
+
+**Problem:** There is no concept of a tenant. All products share a single collection, which leaks rank signals across customer catalogues and makes GDPR/data-residency compliance unenforceable.
+
+**Change:** Introduce a `tenant_id` (resolved from the API key / JWT at the gateway) and map it to a dedicated ChromaDB collection name. The `VectorDB` class already accepts `collection_name` as a constructor argument — this requires only a routing shim on top:
+
+```python
+# app/store/vectordb.py — no change needed
+VectorDB(collection_name=f"features_{tenant_id}")
+VectorDB(collection_name=f"semantic_{tenant_id}")
+```
+
+Add a middleware in `main.py` that extracts `tenant_id` from the `X-API-Key` header and injects it into `request.state`. The route handler reads it and passes it to `find_similar_products`.
+
+---
+
+### 4 — Decouple index building from the query path (event-driven ingestion)
+
+**Problem:** Indexes are built synchronously at cold-start from a static file. A 1 M-product catalogue takes minutes to index, there is no mechanism to update the index as catalogues change, and the query service is unavailable until the build completes.
+
+**Change:** Extract indexing into a separate **Indexing Worker** service that consumes product upsert events from a message broker (Kafka or SAP Event Mesh, one topic per tenant). The query service is read-only and starts instantly because it connects to an already-indexed collection.
+
+```
+ERP / Commerce Cloud → Kafka topic (per tenant) → Indexing Worker → ChromaDB / Redis
+                                                                           ▲
+                                                          Query Service (read-only)
+```
+
+The readiness probe on the query service should verify that the target collection exists and has `count > 0` before the pod accepts traffic.
+
+---
+
+### 5 — Extract the embedding model as a dedicated service
+
+**Problem:** `SentenceTransformer` (`all-MiniLM-L6-v2`) is loaded in-process in every query pod. Every pod holds a copy of the model weights in RAM. Under concurrent load the model becomes a CPU bottleneck, and changing models requires redeploying the entire query service.
+
+**Change:** Deploy a standalone **Embedding Service** (FastAPI + ONNX Runtime or Triton Inference Server). Both the query service and the indexing workers call it via gRPC. Add a Redis cache keyed on `sha256(text)` in front of the model — repeat lookups (the same product queried by many users) never reach the model.
+
+```python
+# Replace in-process call with HTTP/gRPC
+embedding = embedding_client.encode(text_blob)  # cached by content hash
+```
+
+This allows GPU nodes to be targeted exclusively for the embedding service and CPU nodes for query fanout.
+
+---
+
+### 6 — Kubernetes operational hardening
+
+| Item | Current state | Required change |
+|---|---|---|
+| Readiness probe | None | Gate on successful collection connection + `count > 0` |
+| HPA | None | CPU-based HPA for query pods; KEDA consumer-lag HPA for indexing workers |
+| Workers | Forced to `1` | Remove constraint once stores are external; use `--workers 4` |
+| Image size | Large (data baked in) | Stateless image; data from object store at runtime |
+| Secrets | Env vars in pod spec | Move to Kubernetes `Secret` or an external secrets manager |
+
+---
+
+### 7 — Per-tenant observability
+
+**Problem:** There are no metrics. At 50 enterprise customers, aggregate latency hides tenant-specific degradation.
+
+**Change:** Instrument the following with Prometheus labels including `tenant_id`:
+
+- Query latency p50/p99 — alert threshold: p99 > 200 ms
+- Index staleness (time since last successful upsert per collection) — alert threshold: > 15 min for active ingestion pipelines
+- RRF score distribution mean — sudden drops indicate embedding misalignment between the two stores
+- Embedding cache hit rate — if < 60%, review TTL and key strategy
+
+---
+
 ## Potential Enhancements
 
 ### Image-Based Visual Similarity
